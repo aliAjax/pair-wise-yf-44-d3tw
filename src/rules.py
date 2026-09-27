@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .domain import (
     ConflictError,
@@ -6,6 +6,10 @@ from .domain import (
     PermissionDenied,
     ValidationError,
 )
+
+
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _validate_change(actor, data, lookup):
@@ -41,18 +45,240 @@ def _validate_commission(actor, entity, data, lookup):
     return {"commissioned_by": actor.user_id}
 
 
+def _baseline_entries(items, label):
+    """Turn user-supplied parameter/isolation rows into a clean baseline list."""
+    entries = []
+    if not isinstance(items, list):
+        raise ValidationError(label + " must be a list")
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValidationError("%s[%d] must be an object" % (label, index))
+        name = str(item.get("name", "")).strip()
+        if not name:
+            raise ValidationError("%s[%d] name is required" % (label, index))
+        baseline = str(item.get("baseline", "")).strip()
+        if not baseline:
+            raise ValidationError("%s[%d] baseline is required" % (label, index))
+        entries.append(
+            {
+                "name": name,
+                "baseline": baseline,
+                "unit": str(item.get("unit", "") or "").strip(),
+                "note": str(item.get("note", "") or "").strip(),
+            }
+        )
+    return entries
+
+
+def _validate_implement(actor, entity, data, lookup):
+    """实施前保存受影响装置状态、关键工艺参数、隔离措施和恢复负责人。"""
+    unit = _find_one(lookup, "unit", "id", entity["data"].get("unit_id"))
+    if not unit:
+        raise ValidationError("unit does not exist")
+    for key in ("parameters", "isolations"):
+        if key not in data:
+            raise ValidationError("missing required field: " + key)
+    parameters = _baseline_entries(data.get("parameters"), "parameters")
+    isolations = _baseline_entries(data.get("isolations"), "isolations")
+    if not parameters and not isolations:
+        raise ValidationError(
+            "at least one baseline parameter or isolation measure is required before implementation"
+        )
+    recovery_owner = str(data.get("recovery_owner", "")).strip()
+    if not recovery_owner:
+        raise ValidationError("recovery_owner is required before implementation")
+    return {
+        "implemented_by": actor.user_id,
+        "recovery_owner": recovery_owner,
+        "baseline": {
+            "captured_at": _now(),
+            "captured_by": actor.user_id,
+            "unit_id": unit["id"],
+            "unit_name": unit["data"].get("name", ""),
+            "unit_status": unit["status"],
+            "parameters": parameters,
+            "isolations": isolations,
+        },
+    }
+
+
+def _validate_rollback(actor, entity, data, lookup):
+    if not entity["data"].get("baseline"):
+        raise ValidationError(
+            "baseline snapshot is missing; rollback checklist cannot be generated"
+        )
+    return {"rolled_back_by": actor.user_id}
+
+
+def _load_parent_change(entity, lookup):
+    change = _find_one(lookup, "change", "id", entity["data"].get("change_id"))
+    if not change:
+        raise ValidationError("parent change does not exist")
+    return change
+
+
+def _validate_restore(actor, entity, data, lookup):
+    """恢复人逐项填写恢复结果；结果非空，恢复动作进入待复核状态。"""
+    change = _load_parent_change(entity, lookup)
+    owner = str(entity["data"].get("owner", ""))
+    if actor.user_id != owner:
+        raise PermissionDenied(
+            "only the assigned recovery owner (%s) can restore this item" % owner
+        )
+    result = str(data.get("result", "")).strip()
+    if not result:
+        raise ValidationError("recovery result is required")
+    return {
+        "restored_by": actor.user_id,
+        "restored_at": _now(),
+        "result": result,
+    }
+
+
+def _validate_confirm_restore(actor, entity, data, lookup):
+    """恢复人本人不能自审；装置仍停机/冻结时须由未参加实施的安全员复核。"""
+    restorer = entity["data"].get("restored_by")
+    if actor.user_id == restorer:
+        raise PermissionDenied("restorer cannot confirm their own recovery item")
+    change = _load_parent_change(entity, lookup)
+    baseline = change["data"].get("baseline") or {}
+    unit_id = baseline.get("unit_id")
+    unit_status = baseline.get("unit_status")
+    if lookup and unit_id:
+        unit = _find_one(lookup, "unit", "id", unit_id)
+        if unit:
+            unit_status = unit["status"]
+    if unit_status in ("shutdown", "frozen"):
+        if actor.role != "safety":
+            raise PermissionDenied(
+                "unit is %s: only a safety officer independent of implementation can confirm"
+                % unit_status
+            )
+        implementer = change["data"].get("implemented_by")
+        implementers = change["data"].get("implementers")
+        involved = {implementer} if implementer else set()
+        if isinstance(implementers, list):
+            involved.update(implementers)
+        if actor.user_id in involved:
+            raise PermissionDenied(
+                "reviewer must not have participated in the implementation"
+            )
+    return {"confirmed_by": actor.user_id, "confirmed_at": _now()}
+
+
+def _validate_close(actor, entity, data, lookup):
+    """回退后的变更必须在恢复清单全部逐项确认完成后才能关闭。"""
+    if entity["status"] != "rolled_back":
+        return {}
+    items = lookup("recovery_item", "change_id", entity["id"]) or [] if lookup else []
+    if not items:
+        raise ValidationError("rollback recovery checklist is empty")
+    pending = [item["data"].get("ref", item["id"]) for item in items if item["status"] != "confirmed"]
+    if pending:
+        raise ValidationError(
+            "recovery checklist incomplete, unfinished items: " + ", ".join(str(x) for x in pending)
+        )
+    return {"closed_by": actor.user_id}
+
+
 CUSTOM_CREATE = {'change': _validate_change}
-CUSTOM_TRANSITIONS = {('change', 'assess'): _validate_assess, ('change', 'approve'): _validate_approve, ('change', 'commission'): _validate_commission}
+CUSTOM_TRANSITIONS = {
+    ('change', 'assess'): _validate_assess,
+    ('change', 'approve'): _validate_approve,
+    ('change', 'implement'): _validate_implement,
+    ('change', 'commission'): _validate_commission,
+    ('change', 'rollback'): _validate_rollback,
+    ('change', 'close'): _validate_close,
+    ('recovery_item', 'restore'): _validate_restore,
+    ('recovery_item', 'confirm_restore'): _validate_confirm_restore,
+}
 
 
 class RuleEngine:
-    ALIASES = {'units': 'unit', 'changes': 'change', 'action_items': 'action_item'}
-    INITIAL_STATUS = {'unit': 'operating', 'change': 'draft', 'action_item': 'open'}
-    TRANSITIONS = {'unit': {'shutdown': (('operating',), 'shutdown'), 'startup': (('shutdown',), 'operating'), 'freeze': (('operating',), 'frozen'), 'unfreeze': (('frozen',), 'operating')}, 'change': {'assess': (('draft',), 'assessed'), 'approve': (('assessed',), 'approved'), 'implement': (('approved',), 'implemented'), 'commission': (('implemented',), 'commissioned'), 'rollback': (('implemented', 'commissioned'), 'rolled_back'), 'close': (('rolled_back',), 'closed')}, 'action_item': {'complete': (('open',), 'completed'), 'verify': (('completed',), 'verified'), 'reopen': (('verified',), 'open')}}
-    CREATE_REQUIRED = {'unit': ('name', 'location'), 'change': ('unit_id', 'description'), 'action_item': ('change_id', 'description', 'owner')}
-    ACTION_REQUIRED = {('unit', 'shutdown'): ('reason',), ('unit', 'freeze'): ('reason',), ('change', 'assess'): ('risk_level', 'analyst'), ('change', 'approve'): ('approvals', 'permit_id'), ('change', 'implement'): ('procedure_version',), ('change', 'commission'): ('tests_passed',), ('change', 'rollback'): ('reason',), ('change', 'close'): ('outcome',), ('action_item', 'complete'): ('completed_by', 'evidence'), ('action_item', 'verify'): ('verifier',), ('action_item', 'reopen'): ('reason',)}
-    CREATE_ROLES = {'unit': ('admin', 'engineer'), 'change': ('admin', 'engineer'), 'action_item': ('admin', 'safety')}
-    ROLE_ACTIONS = {'shutdown': ('admin', 'operator'), 'startup': ('admin', 'operator'), 'freeze': ('admin', 'operator'), 'unfreeze': ('admin', 'operator'), 'assess': ('admin', 'engineer'), 'approve': ('admin', 'safety'), 'implement': ('admin', 'engineer'), 'commission': ('admin', 'engineer'), 'rollback': ('admin', 'engineer'), 'close': ('admin', 'safety'), 'complete': ('admin', 'engineer'), 'verify': ('admin', 'verifier'), 'reopen': ('admin', 'verifier')}
+    ALIASES = {
+        'units': 'unit',
+        'changes': 'change',
+        'action_items': 'action_item',
+        'recovery_items': 'recovery_item',
+    }
+    INITIAL_STATUS = {
+        'unit': 'operating',
+        'change': 'draft',
+        'action_item': 'open',
+        'recovery_item': 'pending',
+    }
+    TRANSITIONS = {
+        'unit': {
+            'shutdown': (('operating',), 'shutdown'),
+            'startup': (('shutdown',), 'operating'),
+            'freeze': (('operating',), 'frozen'),
+            'unfreeze': (('frozen',), 'operating'),
+        },
+        'change': {
+            'assess': (('draft',), 'assessed'),
+            'approve': (('assessed',), 'approved'),
+            'implement': (('approved',), 'implemented'),
+            'commission': (('implemented',), 'commissioned'),
+            'rollback': (('implemented', 'commissioned'), 'rolled_back'),
+            'close': (('rolled_back',), 'closed'),
+        },
+        'action_item': {
+            'complete': (('open',), 'completed'),
+            'verify': (('completed',), 'verified'),
+            'reopen': (('verified',), 'open'),
+        },
+        'recovery_item': {
+            'restore': (('pending',), 'restored'),
+            'confirm_restore': (('restored',), 'confirmed'),
+            'reject_restore': (('restored',), 'pending'),
+        },
+    }
+    CREATE_REQUIRED = {
+        'unit': ('name', 'location'),
+        'change': ('unit_id', 'description'),
+        'action_item': ('change_id', 'description', 'owner'),
+    }
+    ACTION_REQUIRED = {
+        ('unit', 'shutdown'): ('reason',),
+        ('unit', 'freeze'): ('reason',),
+        ('change', 'assess'): ('risk_level', 'analyst'),
+        ('change', 'approve'): ('approvals', 'permit_id'),
+        ('change', 'implement'): ('procedure_version', 'recovery_owner'),
+        ('change', 'commission'): ('tests_passed',),
+        ('change', 'rollback'): ('reason',),
+        ('change', 'close'): ('outcome',),
+        ('action_item', 'complete'): ('completed_by', 'evidence'),
+        ('action_item', 'verify'): ('verifier',),
+        ('action_item', 'reopen'): ('reason',),
+        ('recovery_item', 'restore'): ('result',),
+        ('recovery_item', 'confirm_restore'): (),
+        ('recovery_item', 'reject_restore'): ('reason',),
+    }
+    CREATE_ROLES = {
+        'unit': ('admin', 'engineer'),
+        'change': ('admin', 'engineer'),
+        'action_item': ('admin', 'safety'),
+        # recovery items are generated by the system on rollback, never via API
+        'recovery_item': (),
+    }
+    ROLE_ACTIONS = {
+        'shutdown': ('admin', 'operator'),
+        'startup': ('admin', 'operator'),
+        'freeze': ('admin', 'operator'),
+        'unfreeze': ('admin', 'operator'),
+        'assess': ('admin', 'engineer'),
+        'approve': ('admin', 'safety'),
+        'implement': ('admin', 'engineer'),
+        'commission': ('admin', 'engineer'),
+        'rollback': ('admin', 'engineer'),
+        'close': ('admin', 'safety'),
+        'complete': ('admin', 'engineer'),
+        'verify': ('admin', 'verifier'),
+        'reopen': ('admin', 'verifier'),
+        ('recovery_item', 'restore'): ('admin', 'engineer', 'operator'),
+        ('recovery_item', 'confirm_restore'): ('admin', 'safety', 'verifier', 'engineer'),
+        ('recovery_item', 'reject_restore'): ('admin', 'safety', 'verifier', 'engineer'),
+    }
 
     def normalize_kind(self, kind):
         return self.ALIASES.get(kind, kind)

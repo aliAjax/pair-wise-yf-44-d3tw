@@ -56,7 +56,45 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        if entity["kind"] == "change" and action == "rollback":
+            self._generate_recovery_checklist(updated, actor)
         return updated
+
+    def _generate_recovery_checklist(self, change, actor):
+        """回退时依据实施前保存的基线快照逐项生成恢复清单。"""
+        existing = self._lookup("recovery_item", "change_id", change["id"])
+        if existing:
+            return existing
+        baseline = change["data"].get("baseline") or {}
+        owner = change["data"].get("recovery_owner", "")
+        created = []
+        for category, label in (("parameters", "参数"), ("isolations", "隔离")):
+            for index, entry in enumerate(baseline.get(category, []), start=1):
+                ref = "%s-%d" % ("P" if category == "parameters" else "I", index)
+                item_data = {
+                    "change_id": change["id"],
+                    "category": category,
+                    "ref": ref,
+                    "name": entry.get("name", ""),
+                    "baseline": entry.get("baseline", ""),
+                    "unit": entry.get("unit", ""),
+                    "note": entry.get("note", ""),
+                    "label": label,
+                    "owner": owner,
+                }
+                item = self.repository.create_entity(
+                    str(uuid4()), "recovery_item", "pending", item_data, "system"
+                )
+                self.audit.record(
+                    item["id"],
+                    actor,
+                    "create",
+                    None,
+                    "pending",
+                    {"kind": "recovery_item", "change_id": change["id"], "ref": ref},
+                )
+                created.append(item)
+        return created
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
@@ -64,10 +102,19 @@ class DomainService:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
 
-    def list(self, kind=None, status=None):
+    def list(self, kind=None, status=None, filters=None):
         if kind:
             kind = self.rules.normalize_kind(kind)
-        return self.repository.list_entities(kind=kind, status=status)
+        items = self.repository.list_entities(kind=kind, status=status)
+        filters = filters or {}
+        for field, value in filters.items():
+            if value is None:
+                continue
+            items = [item for item in items if str(item["data"].get(field, "")) == str(value)]
+        return items
+
+    def recovery_checklist(self, change_id):
+        return self._lookup("recovery_item", "change_id", change_id)
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

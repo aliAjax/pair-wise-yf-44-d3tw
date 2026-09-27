@@ -84,19 +84,26 @@ def create_handler(service, rules, static_dir):
                     with open(index, "r", encoding="utf-8") as handle:
                         return self._send_html(200, handle.read())
                 if parts == ["api", "audit"]:
-                    return self._send(200, {"items": service.audit_log()})
+                    entity_id = parse_qs(parsed.query).get("entity_id", [None])[0]
+                    return self._send(200, {"items": service.audit_log(entity_id)})
                 if len(parts) == 3 and parts[:2] == ["api", "entities"]:
                     return self._send(200, service.get(parts[2]))
+                if len(parts) == 4 and parts[:2] == ["api", "entities"] and parts[3] == "recovery-items":
+                    return self._send(
+                        200,
+                        {"items": service.recovery_checklist(parts[2])},
+                    )
                 if len(parts) >= 2 and parts[0] == "api":
                     if parts[1] == "entities":
                         raise NotFoundError("not found")
                     if len(parts) == 3:
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
-                    status = query.get("status", [None])[0]
+                    status = query.pop("status", [None])[0]
+                    filters = {key: values[0] for key, values in query.items() if values}
                     return self._send(
                         200,
-                        {"items": service.list(parts[1], status=status)},
+                        {"items": service.list(parts[1], status=status, filters=filters)},
                     )
                 raise NotFoundError("not found")
             except Exception as exc:
