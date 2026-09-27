@@ -2,7 +2,7 @@ from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError
-from .rules import RuleEngine
+from .rules import RuleEngine, restoration_checklist_items
 
 
 class DomainService:
@@ -56,7 +56,42 @@ class DomainService:
             updated["status"],
             {"patch": patch},
         )
+        self._after_transition(actor, updated, action)
         return updated
+
+    def _after_transition(self, actor, entity, action):
+        if entity["kind"] == "change" and action == "rollback":
+            self._generate_restoration_checklist(actor, entity)
+
+    def _generate_restoration_checklist(self, actor, change):
+        items = restoration_checklist_items(change)
+        created_ids = []
+        for item in items:
+            record = self.repository.create_entity(
+                str(uuid4()),
+                "restore_item",
+                self.rules.initial_status("restore_item"),
+                item,
+                actor.user_id,
+            )
+            created_ids.append(record["id"])
+            self.audit.record(
+                record["id"],
+                actor,
+                "create",
+                None,
+                record["status"],
+                {"kind": "restore_item", "change_id": change["id"]},
+            )
+        if created_ids:
+            self.audit.record(
+                change["id"],
+                actor,
+                "generate_checklist",
+                change["status"],
+                change["status"],
+                {"restore_item_ids": created_ids},
+            )
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)
@@ -64,10 +99,17 @@ class DomainService:
             raise NotFoundError("entity not found: " + entity_id)
         return entity
 
-    def list(self, kind=None, status=None):
+    def list(self, kind=None, status=None, data_filters=None):
         if kind:
             kind = self.rules.normalize_kind(kind)
-        return self.repository.list_entities(kind=kind, status=status)
+        items = self.repository.list_entities(kind=kind, status=status)
+        for field, value in (data_filters or {}).items():
+            items = [
+                item
+                for item in items
+                if str(item["data"].get(field)) == str(value)
+            ]
+        return items
 
     def audit_log(self, entity_id=None):
         return self.repository.list_audit(entity_id=entity_id)

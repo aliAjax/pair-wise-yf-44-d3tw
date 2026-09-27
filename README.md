@@ -24,12 +24,20 @@ python3 app.py --db ./data.db --port 8310
 
 ## 核心对象
 
-- `unit`：装置运行状态；`change`：变更申请；`action_item`：风险控制行动项。
+- `unit`：装置运行状态；`change`：变更申请；`action_item`：风险控制行动项；`restore_item`：回退恢复清单项。
+
+## 回退恢复流程
+
+- `implement` 时必须提交`key_parameters`（关键工艺参数）和`restoration_owner`（恢复负责人），可选`isolation_measures`（隔离措施）；系统自动快照装置当前状态，一并存入变更的`baseline`。
+- `rollback` 时按基线自动生成`restore_item`清单：装置状态一项、每个工艺参数一项、每条隔离措施一项，初始状态均为`pending`。
+- 恢复人逐项执行`restore`（必填`result`恢复结果）使清单项变为`restored`；复核不通过可用`reopen`打回。
+- 装置仍处于`shutdown`或`frozen`时，每项必须经`review`复核为`verified`才能关闭变更；复核人须为安全员角色、未参加实施（非`implemented_by`/`commissioned_by`），且不能是恢复人本人。
+- 清单全部完成前`close`会被拒绝；装置已恢复`operating`时，`restored`即视为完成。
 
 ## 主要接口
 
 - `GET /health`：健康检查。
-- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤。
+- `GET /api/<kind>`：按对象类型查询，可用`?status=`过滤，其他查询参数按`data`字段等值过滤（如`?change_id=`）。
 - `POST /api/<kind>`：创建对象；请求体为JSON。
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。

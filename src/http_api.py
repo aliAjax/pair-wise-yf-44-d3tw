@@ -94,9 +94,14 @@ def create_handler(service, rules, static_dir):
                         return self._send(200, service.get(parts[2]))
                     query = parse_qs(parsed.query)
                     status = query.get("status", [None])[0]
+                    filters = {
+                        key: values[0]
+                        for key, values in query.items()
+                        if key != "status"
+                    }
                     return self._send(
                         200,
-                        {"items": service.list(parts[1], status=status)},
+                        {"items": service.list(parts[1], status=status, data_filters=filters)},
                     )
                 raise NotFoundError("not found")
             except Exception as exc:

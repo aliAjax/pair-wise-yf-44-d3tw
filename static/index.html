@@ -6,29 +6,245 @@
   <title>化工装置变更与工艺安全管理</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    main { max-width: 960px; margin: auto; }
+    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; font-size: .85rem; }
+    button { padding: .4rem .8rem; cursor: pointer; }
+    input, select, textarea { padding: .35rem; margin: .15rem; }
+    section { border: 1px solid #e5e7eb; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #e5e7eb; padding: .4rem .5rem; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; }
+    .pending { background: #fef3c7; }
+    .restored { background: #ffedd5; }
+    .verified { background: #dcfce7; }
+    .badge { display: inline-block; padding: .1rem .5rem; border-radius: 999px; background: #e5e7eb; font-size: .8rem; }
+    #msg { color: #b91c1c; min-height: 1.2em; }
+    .ok { color: #15803d; }
+    .row { display: flex; gap: 1rem; flex-wrap: wrap; }
+    .row > section { flex: 1; min-width: 280px; }
   </style>
 </head>
 <body>
 <main>
   <h1>化工装置变更与工艺安全管理</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+
+  <section>
+    <h2>当前身份</h2>
+    用户 <input id="userId" value="admin" size="10">
+    角色 <select id="role">
+      <option>admin</option><option>engineer</option><option>safety</option>
+      <option>operator</option><option>verifier</option><option>viewer</option>
+    </select>
+    <span id="msg"></span>
+  </section>
+
+  <div class="row">
+    <section>
+      <h2>新建装置</h2>
+      名称 <input id="unitName" value="Reactor-1" size="12">
+      位置 <input id="unitLocation" value="Plant-A" size="10">
+      <button onclick="createUnit()">创建</button>
+    </section>
+    <section>
+      <h2>新建变更</h2>
+      装置 <select id="changeUnit"></select>
+      描述 <input id="changeDesc" value="调整联锁值" size="14">
+      <button onclick="createChange()">创建</button>
+    </section>
+  </div>
+
+  <section>
+    <h2>变更列表 <button onclick="loadAll()">刷新</button></h2>
+    <table id="changeTable"><thead>
+      <tr><th>ID</th><th>描述</th><th>状态</th><th>版本</th><th></th></tr>
+    </thead><tbody></tbody></table>
+  </section>
+
+  <section id="detailSection" style="display:none">
+    <h2>变更详情</h2>
+    <pre id="changeDetail"></pre>
+    <h3>执行动作</h3>
+    动作 <select id="actionName" onchange="fillTemplate()">
+      <option>assess</option><option>approve</option><option>implement</option>
+      <option>commission</option><option>rollback</option><option>close</option>
+    </select>
+    <br>
+    <textarea id="actionData" rows="6" style="width:100%"></textarea>
+    <br>
+    <button onclick="runAction()">提交动作</button>
+    <span class="ok" id="actionMsg"></span>
+  </section>
+
+  <section id="checklistSection" style="display:none">
+    <h2>回退恢复清单</h2>
+    <p>装置状态：<span class="badge" id="unitStatus">-</span>
+       未完成项：<b id="openCount">0</b> <span id="openLabels"></span></p>
+    <table id="checklistTable"><thead>
+      <tr><th>类别</th><th>恢复项</th><th>目标值</th><th>负责人</th><th>状态</th>
+          <th>恢复人</th><th>复核人</th><th>操作</th></tr>
+    </thead><tbody></tbody></table>
+    <p style="color:#6b7280;font-size:.85rem">
+      装置处于停机或冻结状态时，每项必须由未参加实施的安全员复核（恢复人本人不能自审）后才能关闭变更。
+    </p>
+  </section>
 </main>
+
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const CATEGORY_NAMES = {unit_status: "装置状态", parameter: "工艺参数", isolation: "隔离措施"};
+const STATUS_NAMES = {pending: "待恢复", restored: "已恢复待复核", verified: "已复核"};
+const TEMPLATES = {
+  assess: {risk_level: "medium", analyst: "E-1"},
+  approve: {approvals: ["S-1", "S-2"], permit_id: "MOC-1"},
+  implement: {procedure_version: "v2", restoration_owner: "U-9",
+    key_parameters: [{name: "reactor_temp", value: "180C"}],
+    isolation_measures: [{tag: "XV-101", position: "closed"}]},
+  commission: {tests_passed: true},
+  rollback: {reason: "投用后效果不达标"},
+  close: {outcome: "已恢复原状"}
+};
+let current = {change: null, unit: null, items: []};
+
+function headers() {
+  return {"Content-Type": "application/json",
+    "X-User-Id": document.getElementById("userId").value || "anonymous",
+    "X-Role": document.getElementById("role").value};
 }
+
+async function api(path, options) {
+  const resp = await fetch(path, options);
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(body.error || ("HTTP " + resp.status));
+  return body;
+}
+
+function showError(err) { document.getElementById("msg").textContent = err.message || err; }
+function clearMsg() { document.getElementById("msg").textContent = ""; }
+
+async function createUnit() {
+  clearMsg();
+  try {
+    await api("/api/units", {method: "POST", headers: headers(),
+      body: JSON.stringify({name: unitName.value, location: unitLocation.value})});
+    loadAll();
+  } catch (e) { showError(e); }
+}
+
+async function createChange() {
+  clearMsg();
+  try {
+    await api("/api/changes", {method: "POST", headers: headers(),
+      body: JSON.stringify({unit_id: changeUnit.value, description: changeDesc.value})});
+    loadAll();
+  } catch (e) { showError(e); }
+}
+
+async function loadAll() {
+  clearMsg();
+  try {
+    const units = await api("/api/units");
+    changeUnit.innerHTML = units.items.map(
+      u => `<option value="${u.id}">${u.data.name}</option>`).join("");
+    const changes = await api("/api/changes");
+    changeTable.querySelector("tbody").innerHTML = changes.items.map(c =>
+      `<tr><td>${c.id.slice(0, 8)}</td><td>${c.data.description || ""}</td>` +
+      `<td>${c.status}</td><td>${c.version}</td>` +
+      `<td><button onclick="openChange('${c.id}')">详情</button></td></tr>`).join("");
+    if (current.change) openChange(current.change.id);
+  } catch (e) { showError(e); }
+}
+
+async function openChange(id) {
+  clearMsg();
+  try {
+    const change = await api("/api/entities/" + id);
+    current.change = change;
+    current.unit = change.data.unit_id
+      ? await api("/api/entities/" + change.data.unit_id) : null;
+    const list = await api("/api/restore_items?change_id=" + id);
+    current.items = list.items;
+    detailSection.style.display = "";
+    changeDetail.textContent = JSON.stringify(change, null, 2);
+    fillTemplate();
+    renderChecklist();
+  } catch (e) { showError(e); }
+}
+
+function fillTemplate() {
+  actionData.value = JSON.stringify(TEMPLATES[actionName.value] || {}, null, 2);
+  actionMsg.textContent = "";
+}
+
+async function runAction() {
+  clearMsg();
+  try {
+    const data = JSON.parse(actionData.value || "{}");
+    await api("/api/entities/" + current.change.id + "/actions", {
+      method: "POST", headers: headers(),
+      body: JSON.stringify({action: actionName.value, data,
+        expected_version: current.change.version})});
+    actionMsg.textContent = "已执行 " + actionName.value;
+    openChange(current.change.id);
+    loadAll();
+  } catch (e) { showError(e); }
+}
+
+function isOpen(item, strict) {
+  return strict ? item.status !== "verified"
+                : !(item.status === "restored" || item.status === "verified");
+}
+
+function renderChecklist() {
+  checklistSection.style.display = "";
+  const strict = current.unit &&
+    (current.unit.status === "shutdown" || current.unit.status === "frozen");
+  unitStatus.textContent = current.unit ? current.unit.status : "未知";
+  const open = current.items.filter(it => isOpen(it, strict));
+  openCount.textContent = open.length;
+  openLabels.textContent = open.length
+    ? "（" + open.map(it => it.data.label).join("；") + "）" : "";
+  checklistTable.querySelector("tbody").innerHTML = current.items.map(it => {
+    let ops = "";
+    if (it.status === "pending") {
+      ops = `<input id="res-${it.id}" placeholder="恢复结果" size="12">` +
+        `<button onclick="restoreItem('${it.id}', ${it.version})">确认恢复</button>`;
+    } else if (it.status === "restored") {
+      ops = `<button onclick="reviewItem('${it.id}', ${it.version})">安全员复核</button>` +
+        `<button onclick="reopenItem('${it.id}', ${it.version})">打回</button>`;
+    } else {
+      ops = "✓";
+    }
+    return `<tr class="${it.status}">` +
+      `<td>${CATEGORY_NAMES[it.data.category] || it.data.category || ""}</td>` +
+      `<td>${it.data.label || ""}</td><td>${it.data.target_value ?? ""}</td>` +
+      `<td>${it.data.owner || ""}</td><td>${STATUS_NAMES[it.status] || it.status}</td>` +
+      `<td>${it.data.restored_by || ""}</td><td>${it.data.reviewed_by || ""}</td>` +
+      `<td>${ops}</td></tr>`;
+  }).join("");
+}
+
+async function itemAction(id, version, action, data) {
+  clearMsg();
+  try {
+    await api("/api/entities/" + id + "/actions", {method: "POST", headers: headers(),
+      body: JSON.stringify({action, data, expected_version: version})});
+    openChange(current.change.id);
+  } catch (e) { showError(e); }
+}
+
+function restoreItem(id, version) {
+  const result = document.getElementById("res-" + id).value.trim();
+  if (!result) return showError(new Error("请填写恢复结果"));
+  itemAction(id, version, "restore", {result});
+}
+
+function reviewItem(id, version) { itemAction(id, version, "review", {}); }
+
+function reopenItem(id, version) {
+  const reason = prompt("打回原因");
+  if (reason) itemAction(id, version, "reopen", {reason});
+}
+
+loadAll();
 </script>
 </body>
 </html>
